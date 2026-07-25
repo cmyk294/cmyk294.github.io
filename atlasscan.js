@@ -30,6 +30,8 @@
   var busy = false;
   var resolveScan = null; // pending promise resolver for the active dialog
   var zoomIndex = -1;
+  var cropping = false;
+  var cropRect = null;    // {x,y,w,h} in on-screen pixels, relative to the zoom stage
   var opts = {};
   var jspdfPromise = null;
 
@@ -116,6 +118,27 @@
     '.s2s-znext{right:1rem;top:50%;transform:translateY(-50%)}',
     '.s2s-zcount{position:absolute;bottom:1rem;left:50%;transform:translateX(-50%);color:rgba(255,255,255,.85);',
     'font-size:.85rem;font-weight:600;background:rgba(0,0,0,.45);padding:.3rem .9rem;border-radius:2rem}',
+    /* rotate / crop toolbar */
+    '.s2s-ztools{position:absolute;top:1rem;left:1rem;display:flex;gap:.5rem;z-index:10}',
+    '.s2s-ztools .s2s-zbtn{position:static}',
+    '.s2s-zstage{position:absolute;pointer-events:none}',
+    '.s2s-zoom.s2s-cropmode .s2s-zstage{pointer-events:auto}',
+    '.s2s-zoom.s2s-cropmode .s2s-ztools,.s2s-zoom.s2s-cropmode .s2s-zclose,',
+    '.s2s-zoom.s2s-cropmode .s2s-zprev,.s2s-zoom.s2s-cropmode .s2s-znext,',
+    '.s2s-zoom.s2s-cropmode .s2s-zcount{display:none}',
+    '.s2s-cropbox{position:absolute;display:none;border:2px dashed #fff;box-sizing:border-box;cursor:move;',
+    'box-shadow:0 0 0 9999px rgba(0,0,0,.55)}',
+    '.s2s-zoom.s2s-cropmode .s2s-cropbox{display:block}',
+    '.s2s-crophandle{position:absolute;width:16px;height:16px;margin:-9px;background:#fff;',
+    'border:2px solid #1565C0;border-radius:50%}',
+    '.s2s-crophandle[data-corner="nw"]{top:0;left:0;cursor:nwse-resize}',
+    '.s2s-crophandle[data-corner="ne"]{top:0;left:100%;cursor:nesw-resize}',
+    '.s2s-crophandle[data-corner="sw"]{top:100%;left:0;cursor:nesw-resize}',
+    '.s2s-crophandle[data-corner="se"]{top:100%;left:100%;cursor:nwse-resize}',
+    '.s2s-zcropbar{position:absolute;bottom:1rem;left:50%;transform:translateX(-50%);display:none;gap:.6rem;z-index:10}',
+    '.s2s-zoom.s2s-cropmode .s2s-zcropbar{display:flex}',
+    '.s2s-zcropcancel{background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.3);color:#fff}',
+    '.s2s-zcropcancel:hover{background:rgba(255,255,255,.22)}',
     '@media (max-width:760px){.s2s-body{grid-template-columns:1fr;overflow-y:auto}',
     '.s2s-settings{border-right:none;border-bottom:1px solid var(--s2s-border)}.s2s-grid{min-height:200px}}'
   ].join('');
@@ -187,7 +210,24 @@
     '</div>';
 
   var ZOOM_HTML =
+    '<div class="s2s-ztools">' +
+      '<button type="button" class="s2s-zbtn" data-s2s="zoomRotL" title="Rotate left">⟲</button>' +
+      '<button type="button" class="s2s-zbtn" data-s2s="zoomRotR" title="Rotate right">⟳</button>' +
+      '<button type="button" class="s2s-zbtn" data-s2s="zoomCropBtn" title="Crop">⛶</button>' +
+    '</div>' +
     '<img alt="Scanned page">' +
+    '<div class="s2s-zstage" data-s2s="zoomStage">' +
+      '<div class="s2s-cropbox" data-s2s="cropBox">' +
+        '<span class="s2s-crophandle" data-corner="nw"></span>' +
+        '<span class="s2s-crophandle" data-corner="ne"></span>' +
+        '<span class="s2s-crophandle" data-corner="sw"></span>' +
+        '<span class="s2s-crophandle" data-corner="se"></span>' +
+      '</div>' +
+    '</div>' +
+    '<div class="s2s-zcropbar" data-s2s="cropBar">' +
+      '<button type="button" class="s2s-btn s2s-zcropcancel" data-s2s="cropCancel">Cancel</button>' +
+      '<button type="button" class="s2s-btn s2s-btn-ok" data-s2s="cropApply">Apply Crop</button>' +
+    '</div>' +
     '<button type="button" class="s2s-zbtn s2s-zclose" title="Close (Esc)">✕</button>' +
     '<button type="button" class="s2s-zbtn s2s-zprev" title="Previous page (←)">‹</button>' +
     '<button type="button" class="s2s-zbtn s2s-znext" title="Next page (→)">›</button>' +
@@ -215,6 +255,7 @@
 
     ui = { overlay: overlay, zoom: zoom, title: overlay.querySelector('.s2s-title') };
     overlay.querySelectorAll('[data-s2s]').forEach(function (el) { ui[el.getAttribute('data-s2s')] = el; });
+    zoom.querySelectorAll('[data-s2s]').forEach(function (el) { ui[el.getAttribute('data-s2s')] = el; });
     ui.zoomImg   = zoom.querySelector('img');
     ui.zoomCount = zoom.querySelector('.s2s-zcount');
     ui.zoomPrev  = zoom.querySelector('.s2s-zprev');
@@ -235,10 +276,27 @@
     ui.zoomImg.onclick = closeZoom;
     ui.zoomPrev.onclick = function () { zoomNav(-1); };
     ui.zoomNext.onclick = function () { zoomNav(1); };
-    zoom.onclick = function (e) { if (e.target === zoom) closeZoom(); };
+    zoom.onclick = function (e) { if (cropping) return; if (e.target === zoom) closeZoom(); };
+
+    ui.zoomRotL.onclick = function () { rotatePage(-90); };
+    ui.zoomRotR.onclick = function () { rotatePage(90); };
+    ui.zoomCropBtn.onclick = enterCropMode;
+    ui.cropCancel.onclick = exitCropMode;
+    ui.cropApply.onclick = applyCrop;
+    ui.cropBox.addEventListener('pointerdown', function (e) {
+      if (e.target !== ui.cropBox) return; // handles have their own listener
+      startCropDrag('move', null, e);
+    });
+    zoom.querySelectorAll('.s2s-crophandle').forEach(function (h) {
+      h.addEventListener('pointerdown', function (e) {
+        e.stopPropagation();
+        startCropDrag('resize', h.getAttribute('data-corner'), e);
+      });
+    });
 
     document.addEventListener('keydown', function (e) {
       if (zoom.classList.contains('s2s-open')) {
+        if (cropping) { if (e.key === 'Escape') exitCropMode(); return; }
         if (e.key === 'Escape') closeZoom();
         if (e.key === 'ArrowLeft') zoomNav(-1);
         if (e.key === 'ArrowRight') zoomNav(1);
@@ -419,7 +477,11 @@
 
   // ── zoom lightbox ──
   function openZoom(i) { zoomIndex = i; updateZoom(); ui.zoom.classList.add('s2s-open'); }
-  function closeZoom() { ui.zoom.classList.remove('s2s-open'); zoomIndex = -1; }
+  function closeZoom() {
+    if (cropping) exitCropMode();
+    ui.zoom.classList.remove('s2s-open');
+    zoomIndex = -1;
+  }
   function zoomNav(d) {
     var n = zoomIndex + d;
     if (n < 0 || n >= pages.length) return;
@@ -431,6 +493,129 @@
     ui.zoomCount.textContent = 'Page ' + (zoomIndex + 1) + ' of ' + pages.length;
     ui.zoomPrev.disabled = zoomIndex === 0;
     ui.zoomNext.disabled = zoomIndex === pages.length - 1;
+  }
+
+  // ── rotate ──
+  function rotatePage(deg) {
+    if (zoomIndex < 0) return;
+    var i = zoomIndex;
+    var p = pages[i];
+    var img = new Image();
+    img.onload = function () {
+      var w = img.naturalWidth, h = img.naturalHeight;
+      var c = document.createElement('canvas');
+      c.width = h; c.height = w;
+      var ctx = c.getContext('2d');
+      ctx.translate(c.width / 2, c.height / 2);
+      ctx.rotate(deg * Math.PI / 180);
+      ctx.drawImage(img, -w / 2, -h / 2);
+      pages[i] = { dataUrl: c.toDataURL('image/jpeg', 0.92), width: h, height: w, dpi: p.dpi, blank: p.blank };
+      renderPages();
+      updateZoom();
+    };
+    img.src = p.dataUrl;
+  }
+
+  // ── crop ──
+  function enterCropMode() {
+    if (zoomIndex < 0) return;
+    cropping = true;
+    ui.zoom.classList.add('s2s-cropmode');
+    syncCropStage();
+    var sw = ui.zoomStage.clientWidth, sh = ui.zoomStage.clientHeight;
+    var pad = 0.08;
+    cropRect = { x: sw * pad, y: sh * pad, w: sw * (1 - 2 * pad), h: sh * (1 - 2 * pad) };
+    renderCropBox();
+    window.addEventListener('resize', syncCropStage);
+  }
+
+  function exitCropMode() {
+    cropping = false;
+    cropRect = null;
+    ui.zoom.classList.remove('s2s-cropmode');
+    window.removeEventListener('resize', syncCropStage);
+  }
+
+  function syncCropStage() {
+    var r = ui.zoomImg.getBoundingClientRect();
+    var zr = ui.zoom.getBoundingClientRect();
+    ui.zoomStage.style.left = (r.left - zr.left) + 'px';
+    ui.zoomStage.style.top = (r.top - zr.top) + 'px';
+    ui.zoomStage.style.width = r.width + 'px';
+    ui.zoomStage.style.height = r.height + 'px';
+  }
+
+  function renderCropBox() {
+    ui.cropBox.style.left = cropRect.x + 'px';
+    ui.cropBox.style.top = cropRect.y + 'px';
+    ui.cropBox.style.width = cropRect.w + 'px';
+    ui.cropBox.style.height = cropRect.h + 'px';
+  }
+
+  function startCropDrag(mode, corner, e) {
+    e.preventDefault();
+    var orig = { x: cropRect.x, y: cropRect.y, w: cropRect.w, h: cropRect.h };
+    var startX = e.clientX, startY = e.clientY;
+    var MIN = 24;
+
+    function onMove(ev) {
+      var dx = ev.clientX - startX, dy = ev.clientY - startY;
+      var sw = ui.zoomStage.clientWidth, sh = ui.zoomStage.clientHeight;
+
+      if (mode === 'move') {
+        cropRect.x = Math.max(0, Math.min(orig.x + dx, sw - orig.w));
+        cropRect.y = Math.max(0, Math.min(orig.y + dy, sh - orig.h));
+      } else {
+        var right = orig.x + orig.w, bottom = orig.y + orig.h;
+        if (corner === 'nw' || corner === 'sw') {
+          var newX = Math.max(0, Math.min(orig.x + dx, right - MIN));
+          cropRect.x = newX; cropRect.w = right - newX;
+        } else {
+          var newRight = Math.min(sw, Math.max(orig.x + orig.w + dx, orig.x + MIN));
+          cropRect.w = newRight - cropRect.x;
+        }
+        if (corner === 'nw' || corner === 'ne') {
+          var newY = Math.max(0, Math.min(orig.y + dy, bottom - MIN));
+          cropRect.y = newY; cropRect.h = bottom - newY;
+        } else {
+          var newBottom = Math.min(sh, Math.max(orig.y + orig.h + dy, orig.y + MIN));
+          cropRect.h = newBottom - cropRect.y;
+        }
+      }
+      renderCropBox();
+    }
+    function onUp() {
+      document.removeEventListener('pointermove', onMove);
+      document.removeEventListener('pointerup', onUp);
+    }
+    document.addEventListener('pointermove', onMove);
+    document.addEventListener('pointerup', onUp);
+  }
+
+  function applyCrop() {
+    if (zoomIndex < 0 || !cropRect) return;
+    var i = zoomIndex;
+    var p = pages[i];
+    var stageW = ui.zoomStage.clientWidth, stageH = ui.zoomStage.clientHeight;
+    var rect = cropRect;
+    var img = new Image();
+    img.onload = function () {
+      var scaleX = img.naturalWidth / stageW;
+      var scaleY = img.naturalHeight / stageH;
+      var sx = Math.max(0, Math.round(rect.x * scaleX));
+      var sy = Math.max(0, Math.round(rect.y * scaleY));
+      var sw = Math.min(img.naturalWidth - sx, Math.round(rect.w * scaleX));
+      var sh = Math.min(img.naturalHeight - sy, Math.round(rect.h * scaleY));
+      var c = document.createElement('canvas');
+      c.width = sw; c.height = sh;
+      var ctx = c.getContext('2d');
+      ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+      pages[i] = { dataUrl: c.toDataURL('image/jpeg', 0.92), width: sw, height: sh, dpi: p.dpi, blank: p.blank };
+      exitCropMode();
+      renderPages();
+      updateZoom();
+    };
+    img.src = p.dataUrl;
   }
 
   // ── PDF assembly ──
