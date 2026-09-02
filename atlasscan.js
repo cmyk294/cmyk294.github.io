@@ -16,7 +16,9 @@
  *     }                    // result is null if the user cancelled
  *   </script>
  *
- * Options: AtlasScan.scan({ serviceUrl, theme: 'dark'|'light', title })
+ * Options: AtlasScan.scan({ serviceUrl, theme: 'dark'|'light', title, hideBrightnessContrast })
+ * hideBrightnessContrast hides those two sliders for backends that can't act on them
+ * (e.g. the NAPS2 bridge service, whose ad-hoc CLI mode has no brightness/contrast flags).
  * jsPDF is loaded automatically from a CDN if the page hasn't already included it.
  */
 (function (global) {
@@ -678,7 +680,8 @@
     opts = Object.assign({
       serviceUrl: DEFAULT_SERVICE_URL,
       theme: 'dark',
-      title: 'Scan Document'
+      title: 'Scan Document',
+      hideBrightnessContrast: false
     }, options || {});
 
     ensureUI();
@@ -686,6 +689,11 @@
 
     ui.title.textContent = opts.title;
     ui.overlay.classList.toggle('s2s-light', opts.theme === 'light');
+    // Some backends (e.g. NAPS2's ad-hoc/no-profile CLI mode) have no way to apply
+    // brightness/contrast per scan — hide the sliders rather than let them silently do nothing.
+    var bcDisplay = opts.hideBrightnessContrast ? 'none' : '';
+    ui.brightness.closest('.s2s-group').style.display = bcDisplay;
+    ui.contrast.closest('.s2s-group').style.display = bcDisplay;
     pages = [];
     renderPages();
     setStatus('');
